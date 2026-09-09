@@ -1,58 +1,27 @@
 use cubecl::features::TypeUsage;
 use cubecl::prelude::*;
-use serde::{Deserialize, Serialize};
 
 use super::extremum::numeric_is_nan;
-use crate::components::instructions::{ReduceOutputMode, Value};
+use crate::components::instructions::ReduceOutputMode;
 use crate::components::precision::ReducePrecision;
 
 /// A value and its coordinate folded into one unsigned integer, so that one
-/// unsigned comparison ranks the pair: by value in a [`ValueOrder`], and by the
-/// lower coordinate where two values are equal.
+/// unsigned comparison ranks the pair: by value, largest first, and by the lower
+/// coordinate where two values are equal.
 pub(crate) type Packed = u64;
 
 const SIGN: u32 = 0x8000_0000;
 
-/// Which end of the value range a packed value ranks first.
+/// Packs a value and its coordinate into a [`Packed`], and reads them back.
 ///
-/// A NaN outranks every number in both, so neither is the other's reverse and a
-/// value packed for one cannot be read back as the other.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum ValueOrder {
-    /// Largest value first, as top-k and max rank.
-    Descending,
-    /// Smallest value first, as min ranks.
-    Ascending,
-}
-
-/// Packs a value and its coordinate into a [`Packed`], and reads them back, in
-/// one [`ValueOrder`].
-///
-/// Packing and unpacking need the order; comparing two packed values does not,
-/// since each already carries it. That is what separates the methods taking
-/// `&self` from the associated ones that do not.
-#[derive(Debug, CubeType, Clone)]
-pub(crate) struct Packing {
-    #[cube(comptime)]
-    order: ValueOrder,
-}
+/// Only the largest-first order exists, because only top-k packs and top-k ranks
+/// that way. Max and min rank their single slot cheaper unpacked, since packing
+/// pays for itself per slot but builds its value per element, so nothing asks for
+/// the reverse map.
+pub(crate) struct Packing {}
 
 #[cube]
 impl Packing {
-    /// Ranks the largest value first, as top-k and max rank.
-    pub fn descending() -> Packing {
-        Packing {
-            order: ValueOrder::Descending,
-        }
-    }
-
-    /// Ranks the smallest value first, as min ranks.
-    pub fn ascending() -> Packing {
-        Packing {
-            order: ValueOrder::Ascending,
-        }
-    }
-
     /// Whether a coordinate-tracking reduction packs on this device.
     pub fn packs<P: ReducePrecision>(#[comptime] output: ReduceOutputMode) -> comptime_type!(bool) {
         let tracks_coordinates = comptime!(output.has_indices());
@@ -80,14 +49,13 @@ impl Packing {
     }
 
     pub fn pack<N: Numeric, S: Size>(
-        &self,
         value: Vector<N, S>,
         coordinate: Vector<u32, S>,
     ) -> Vector<Packed, S> {
         // Inverted, so that a lower coordinate makes a larger packed and wins a tie.
         let rank = Vector::new(u32::MAX) - coordinate;
 
-        (Vector::<Packed, S>::cast_from(self.order_bits::<N, S>(value)) << Vector::new(32u64))
+        (Vector::<Packed, S>::cast_from(Packing::order_bits::<N, S>(value)) << Vector::new(32u64))
             | Vector::<Packed, S>::cast_from(rank)
     }
 
@@ -98,22 +66,16 @@ impl Packing {
     /// That coordinate's rank is zero, and it is written as zero rather than
     /// computed: the subtraction of a constant from itself is folded by the WGSL
     /// optimizer into a constant it cannot build for a vector type.
-    pub fn empty<N: Numeric, S: Size>(&self, last: Vector<N, S>) -> Vector<Packed, S> {
-        Vector::<Packed, S>::cast_from(self.order_bits::<N, S>(last)) << Vector::new(32u64)
+    pub fn empty<N: Numeric, S: Size>(last: Vector<N, S>) -> Vector<Packed, S> {
+        Vector::<Packed, S>::cast_from(Packing::order_bits::<N, S>(last)) << Vector::new(32u64)
     }
 
-    pub fn value<N: Numeric, S: Size>(&self, packed: Vector<Packed, S>) -> Vector<N, S> {
-        self.value_from_order_bits::<N, S>(Vector::cast_from(packed >> Vector::new(32u64)))
+    pub fn value<N: Numeric, S: Size>(packed: Vector<Packed, S>) -> Vector<N, S> {
+        Packing::value_from_order_bits::<N, S>(Vector::cast_from(packed >> Vector::new(32u64)))
     }
 
     pub fn coordinate<S: Size>(packed: Vector<Packed, S>) -> Vector<u32, S> {
         Vector::new(u32::MAX) - Vector::cast_from(packed & Vector::new(0xFFFF_FFFFu64))
-    }
-
-    /// Keep whichever of the slot and `candidate` ranks better.
-    pub fn insert<S: Size>(packed: &mut Value<Vector<Packed, S>>, candidate: Vector<Packed, S>) {
-        let winning = Packing::better::<S>(packed.item(), candidate);
-        packed.assign(&Value::new_single(winning));
     }
 
     /// Insert a candidate into `packed`, held in ranked order, dropping the last.
@@ -139,29 +101,8 @@ impl Packing {
         }
     }
 
-    /// Collapse a vectorized accumulator's lanes down to the one that wins.
-    pub fn finalize<S: Size>(packed: Vector<Packed, S>) -> Packed {
-        let vector_size = packed.vector_size().comptime();
-        let mut winning = packed.extract(0usize);
-
-        #[unroll]
-        for k in 1..vector_size {
-            let candidate = packed.extract(k);
-            winning = select(winning > candidate, winning, candidate);
-        }
-
-        winning
-    }
-
-    fn better<S: Size>(
-        current: Vector<Packed, S>,
-        candidate: Vector<Packed, S>,
-    ) -> Vector<Packed, S> {
-        select_many(current.greater_than(&candidate), current, candidate)
-    }
-
     /// The value's bits mapped so that unsigned comparison of the results ranks
-    /// the values in this order.
+    /// the values largest first.
     ///
     /// A float's sign bit orders backwards and its magnitude bits invert under
     /// it, hence the flip. `-0.0` is mapped onto `+0.0`, since the two compare
@@ -170,7 +111,7 @@ impl Packing {
     /// sign, so NaNs outrank every number and tie among themselves, leaving the
     /// coordinate to decide as the instructions' policy states. A winning NaN
     /// therefore reads back as a canonical NaN, not as its input bits.
-    fn order_bits<N: Numeric, S: Size>(&self, value: Vector<N, S>) -> Vector<u32, S> {
+    fn order_bits<N: Numeric, S: Size>(value: Vector<N, S>) -> Vector<u32, S> {
         let bits = Vector::<u32, S>::reinterpret(value);
         let sign = Vector::new(SIGN);
         let elem = elem_type_of::<N>();
@@ -178,55 +119,35 @@ impl Packing {
         match comptime!(elem) {
             ElemType::Float(_) => {
                 let zero = Vector::new(N::from_int(0));
-
-                let ordered = match comptime!(self.order) {
-                    ValueOrder::Descending => select_many(
-                        value.less_than(&zero),
-                        Vector::new(u32::MAX) - bits,
-                        bits | sign,
-                    ),
-                    ValueOrder::Ascending => {
-                        select_many(value.greater_than(&zero), sign - bits, bits | sign)
-                    }
-                };
+                let ordered = select_many(
+                    value.less_than(&zero),
+                    Vector::new(u32::MAX) - bits,
+                    bits | sign,
+                );
 
                 select_many(numeric_is_nan(value), Vector::new(u32::MAX), ordered)
             }
-            ElemType::Int(_) => self.reversed_if_ascending::<S>(bits ^ sign),
-            ElemType::UInt(_) => self.reversed_if_ascending::<S>(bits),
-            _ => panic!("an order packed packs floats, signed and unsigned integers only"),
+            ElemType::Int(_) => bits ^ sign,
+            ElemType::UInt(_) => bits,
+            _ => panic!("a packed value packs floats, signed and unsigned integers only"),
         }
     }
 
-    fn value_from_order_bits<N: Numeric, S: Size>(&self, bits: Vector<u32, S>) -> Vector<N, S> {
+    fn value_from_order_bits<N: Numeric, S: Size>(bits: Vector<u32, S>) -> Vector<N, S> {
         let sign = Vector::new(SIGN);
         let elem = elem_type_of::<N>();
 
         let value_bits = match comptime!(elem) {
-            ElemType::Float(_) => match comptime!(self.order) {
-                ValueOrder::Descending => select_many(
-                    (bits & sign).equal(&Vector::new(0u32)),
-                    Vector::new(u32::MAX) - bits,
-                    bits ^ sign,
-                ),
-                // `<=` rather than a sign test, so that the one packed both zeros share
-                // reads back as `+0.0` here as it does in the descending arm.
-                ValueOrder::Ascending => select_many(bits.less_equal(&sign), sign - bits, bits),
-            },
-            ElemType::Int(_) => self.reversed_if_ascending::<S>(bits) ^ sign,
-            ElemType::UInt(_) => self.reversed_if_ascending::<S>(bits),
-            _ => panic!("an order packed packs floats, signed and unsigned integers only"),
+            ElemType::Float(_) => select_many(
+                (bits & sign).equal(&Vector::new(0u32)),
+                Vector::new(u32::MAX) - bits,
+                bits ^ sign,
+            ),
+            ElemType::Int(_) => bits ^ sign,
+            ElemType::UInt(_) => bits,
+            _ => panic!("a packed value packs floats, signed and unsigned integers only"),
         };
 
         Vector::<N, S>::reinterpret(value_bits)
-    }
-
-    /// Reverse an unsigned image that already rises with the value, so that it
-    /// falls with it instead. Its own inverse, so both directions of the map use it.
-    fn reversed_if_ascending<S: Size>(&self, rising: Vector<u32, S>) -> Vector<u32, S> {
-        match comptime!(self.order) {
-            ValueOrder::Descending => rising,
-            ValueOrder::Ascending => Vector::new(u32::MAX) - rising,
-        }
     }
 }

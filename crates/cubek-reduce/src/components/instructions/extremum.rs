@@ -1,9 +1,9 @@
 use super::{ArgAccumulator, ReduceFamily, ReduceInstruction, lowest_coordinate_matching};
 use crate::components::{
     instructions::{
-        Accumulator, AccumulatorExpand, AccumulatorFormat, Item, Packed, Packing, ReduceOutputMode,
+        Accumulator, AccumulatorExpand, AccumulatorFormat, Item, ReduceOutputMode,
         ReduceRequirements, ReduceStep, ReduceWithIndices, ReduceWithIndicesFamily, SlotCount,
-        Value, ValueExpand, ValueOrder,
+        Value, ValueExpand,
     },
     precision::ReducePrecision,
 };
@@ -23,6 +23,17 @@ pub(super) fn numeric_is_nan<E: Numeric, N: Size>(item: Vector<E, N>) -> Vector<
         let is_nan = IsNanOp::new(scope.ctx_mut(), item);
         scope.register_with_result(&is_nan).into()
     })
+}
+
+/// Which end of the value range ranks first.
+///
+/// A NaN outranks every number in both, so neither is the other's reverse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ValueOrder {
+    /// Largest value first, as max ranks.
+    Descending,
+    /// Smallest value first, as min ranks.
+    Ascending,
 }
 
 /// The value a slot starts from: the worst this `order` can rank, so any
@@ -314,13 +325,6 @@ impl Extremum {
         }
     }
 
-    fn packing(&self) -> Packing {
-        match comptime!(self.order) {
-            ValueOrder::Descending => Packing::descending(),
-            ValueOrder::Ascending => Packing::ascending(),
-        }
-    }
-
     fn identity<E: Numeric>(&self) -> E {
         extremum_identity::<E>(self.order)
     }
@@ -463,15 +467,8 @@ impl<P: ReducePrecision> ReduceInstruction<P> for Extremum {
         }
     }
 
-    fn accumulator_format(this: &Self) -> comptime_type!(AccumulatorFormat) {
-        let packs = false;
-        let _ = Packing::packs::<P>(this.output);
-
-        comptime!(if packs {
-            AccumulatorFormat::Packed(SlotCount::Single)
-        } else {
-            AccumulatorFormat::Unpacked(SlotCount::Single)
-        })
+    fn accumulator_format(_this: &Self) -> comptime_type!(AccumulatorFormat) {
+        comptime!(AccumulatorFormat::Unpacked(SlotCount::Single))
     }
 
     fn from_config(#[comptime] config: Self::Config) -> Self {
@@ -486,25 +483,16 @@ impl<P: ReducePrecision> ReduceInstruction<P> for Extremum {
     }
 
     fn null_accumulator(this: &Self) -> Accumulator<P> {
-        let packs = false;
-
-        if comptime!(packs) {
-            Accumulator::new_Packed(Value::new_single(
-                this.packing()
-                    .empty::<P::EA, P::SI>(Vector::new(this.identity::<P::EA>())),
-            ))
+        let args = if comptime!(this.output.has_indices()) {
+            Value::new_single(Vector::empty().fill(u32::MAX))
         } else {
-            let args = if comptime!(this.output.has_indices()) {
-                Value::new_single(Vector::empty().fill(u32::MAX))
-            } else {
-                Value::new_None()
-            };
+            Value::new_None()
+        };
 
-            Accumulator::new_Unpacked(
-                Value::new_single(Vector::empty().fill(this.identity::<P::EA>())),
-                args,
-            )
-        }
+        Accumulator::new_Unpacked(
+            Value::new_single(Vector::empty().fill(this.identity::<P::EA>())),
+            args,
+        )
     }
 
     fn reduce(
@@ -514,17 +502,8 @@ impl<P: ReducePrecision> ReduceInstruction<P> for Extremum {
         #[comptime] reduce_step: ReduceStep,
     ) {
         match accumulator {
-            Accumulator::Packed(packed) => {
-                let candidate = this
-                    .packing()
-                    .pack::<P::EA, P::SI>(Vector::cast_from(item.elements), item.args.item());
-
-                let candidate = match reduce_step {
-                    ReduceStep::Plane => plane_max(candidate),
-                    ReduceStep::Identity => candidate,
-                };
-
-                Packing::insert::<P::SI>(packed, candidate);
+            Accumulator::Packed(_) => {
+                panic!("an extremum never packs: one slot ranks cheaper unpacked")
             }
             Accumulator::Unpacked { elements, args } => {
                 let (candidate, candidate_coord) = match reduce_step {
@@ -544,9 +523,8 @@ impl<P: ReducePrecision> ReduceInstruction<P> for Extremum {
 
     fn plane_reduce_inplace(this: &Self, accumulator: &mut Accumulator<P>) {
         match accumulator {
-            Accumulator::Packed(packed) => {
-                let winning = plane_max(packed.item());
-                packed.assign(&Value::new_single(winning));
+            Accumulator::Packed(_) => {
+                panic!("an extremum never packs: one slot ranks cheaper unpacked")
             }
             Accumulator::Unpacked { elements, args } => {
                 let (candidate, candidate_coord) = this.plane_candidate(elements.item(), &*args);
@@ -557,9 +535,6 @@ impl<P: ReducePrecision> ReduceInstruction<P> for Extremum {
 
     fn fuse_accumulators(this: &Self, accumulator: &mut Accumulator<P>, other: &Accumulator<P>) {
         match (accumulator, other) {
-            (Accumulator::Packed(packed), Accumulator::Packed(other_packed)) => {
-                Packing::insert::<P::SI>(packed, other_packed.item())
-            }
             (
                 Accumulator::Unpacked { elements, args },
                 Accumulator::Unpacked {
@@ -567,7 +542,7 @@ impl<P: ReducePrecision> ReduceInstruction<P> for Extremum {
                     args: other_args,
                 },
             ) => this.insert(elements, args, other_elements.item(), other_args),
-            _ => panic!("both accumulators must hold the same representation"),
+            _ => panic!("an extremum never packs: one slot ranks cheaper unpacked"),
         }
     }
 
@@ -581,20 +556,8 @@ impl<P: ReducePrecision> ReduceInstruction<P> for Extremum {
         _shape_axis_reduce: usize,
     ) -> (Value<Out>, Value<Idx>) {
         match accumulator {
-            Accumulator::Packed(packed) => {
-                let candidate =
-                    Vector::<Packed, Const<1>>::new(Packing::finalize::<P::SI>(packed.item()));
-
-                (
-                    Value::new_single(Out::cast_from(
-                        this.packing()
-                            .value::<P::EA, Const<1>>(candidate)
-                            .extract(0usize),
-                    )),
-                    Value::new_single(Idx::cast_from(
-                        Packing::coordinate::<Const<1>>(candidate).extract(0usize),
-                    )),
-                )
+            Accumulator::Packed(_) => {
+                panic!("an extremum never packs: one slot ranks cheaper unpacked")
             }
             Accumulator::Unpacked { elements, args } => match args {
                 Value::None => {
@@ -630,19 +593,13 @@ impl<P: ReducePrecision> ReduceInstruction<P> for Extremum {
     }
 
     fn to_output_perpendicular<Out: Numeric, Idx: Numeric>(
-        this: &Self,
+        _this: &Self,
         accumulator: Accumulator<P>,
         _shape_axis_reduce: usize,
     ) -> (Value<Vector<Out, P::SI>>, Value<Vector<Idx, P::SI>>) {
         match accumulator {
-            Accumulator::Packed(packed) => {
-                let candidate = packed.item();
-                (
-                    Value::new_single(Vector::cast_from(
-                        this.packing().value::<P::EA, P::SI>(candidate),
-                    )),
-                    Value::new_single(Vector::cast_from(Packing::coordinate::<P::SI>(candidate))),
-                )
+            Accumulator::Packed(_) => {
+                panic!("an extremum never packs: one slot ranks cheaper unpacked")
             }
             Accumulator::Unpacked { elements, args } => {
                 let values = Value::new_single(Vector::cast_from(elements.item()));

@@ -15,7 +15,6 @@ pub use extremum::*;
 pub use maxabs::*;
 pub use mean::*;
 pub use mixed::*;
-pub use packing::ValueOrder;
 pub(crate) use packing::*;
 pub use predicate::*;
 pub use prod::*;

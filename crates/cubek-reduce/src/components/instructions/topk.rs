@@ -205,9 +205,7 @@ impl TopK {
         let k = comptime!(self.k);
         let vector_size = packed[0].vector_size().comptime();
 
-        let empty = Packing::descending()
-            .empty::<P::EA, P::SI>(Vector::new(P::EA::min_value()))
-            .extract(0usize);
+        let empty = Packing::empty::<P::EA, P::SI>(Vector::new(P::EA::min_value())).extract(0usize);
 
         let mut topk = Array::new(k);
         #[unroll]
@@ -361,7 +359,7 @@ impl TopK {
             let is_winner = local_best.equal(&winning);
             local_best = select_many(
                 is_winner,
-                Packing::descending().empty::<N, S>(Vector::new(N::min_value())),
+                Packing::empty::<N, S>(Vector::new(N::min_value())),
                 local_best,
             );
         }
@@ -376,7 +374,7 @@ impl TopK {
 
         #[unroll(k * k <= crate::components::instructions::TOPK_UNROLL_BUDGET)]
         for i in 0..k {
-            let mut local = Packing::descending().empty::<N, S>(Vector::new(N::min_value()));
+            let mut local = Packing::empty::<N, S>(Vector::new(N::min_value()));
 
             #[unroll(k * k <= crate::components::instructions::TOPK_UNROLL_BUDGET)]
             for j in 0..k {
@@ -525,8 +523,7 @@ impl<P: ReducePrecision> ReduceInstruction<P> for TopK {
         let packed = this.packs::<P>();
 
         if comptime!(packed) {
-            let empty =
-                Packing::descending().empty::<P::EA, P::SI>(Vector::new(P::EA::min_value()));
+            let empty = Packing::empty::<P::EA, P::SI>(Vector::new(P::EA::min_value()));
 
             let mut packed = Array::new(comptime!(this.k));
             #[unroll]
@@ -565,8 +562,10 @@ impl<P: ReducePrecision> ReduceInstruction<P> for TopK {
     ) {
         match accumulator {
             Accumulator::Packed(packed) => {
-                let candidate = Packing::descending()
-                    .pack::<P::EA, P::SI>(Vector::cast_from(item.elements), item.args.item());
+                let candidate = Packing::pack::<P::EA, P::SI>(
+                    Vector::cast_from(item.elements),
+                    item.args.item(),
+                );
                 let packed = packed.multiple_mut();
 
                 match reduce_step {
@@ -660,11 +659,8 @@ impl<P: ReducePrecision> ReduceInstruction<P> for TopK {
                 #[unroll]
                 for i in 0..this.k {
                     let candidate = Vector::<Packed, P::SI>::new(packed[i]);
-                    out_values[i] = Out::cast_from(
-                        Packing::descending()
-                            .value::<P::EA, P::SI>(candidate)
-                            .extract(0usize),
-                    );
+                    out_values[i] =
+                        Out::cast_from(Packing::value::<P::EA, P::SI>(candidate).extract(0usize));
                     out_indices[i] =
                         Idx::cast_from(Packing::coordinate::<P::SI>(candidate).extract(0usize));
                 }
@@ -713,8 +709,7 @@ impl<P: ReducePrecision> ReduceInstruction<P> for TopK {
                 let mut out_indices = Array::new(this.k);
                 #[unroll]
                 for i in 0..this.k {
-                    out_values[i] =
-                        Vector::cast_from(Packing::descending().value::<P::EA, P::SI>(packed[i]));
+                    out_values[i] = Vector::cast_from(Packing::value::<P::EA, P::SI>(packed[i]));
                     out_indices[i] = Vector::cast_from(Packing::coordinate::<P::SI>(packed[i]));
                 }
 
