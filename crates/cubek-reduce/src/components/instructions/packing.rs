@@ -53,10 +53,57 @@ impl Packing {
         coordinate: Vector<u32, S>,
     ) -> Vector<Packed, S> {
         // Inverted, so that a lower coordinate makes a larger packed and wins a tie.
-        let rank = Vector::new(u32::MAX) - coordinate;
+        let tie_break = Vector::new(u32::MAX) - coordinate;
 
-        (Vector::<Packed, S>::cast_from(Packing::order_bits::<N, S>(value)) << Vector::new(32u64))
-            | Vector::<Packed, S>::cast_from(rank)
+        Packing::fold::<S>(Packing::rank::<N, S>(value), tie_break)
+    }
+
+    /// The half of a [`Packed`] that orders values, which ranks them on its own
+    /// whenever no tie has to be broken.
+    ///
+    /// Half the width and none of the widening, so a candidate can be weighed
+    /// against [`Self::weakest`] before anything folds a coordinate into it.
+    pub fn rank<N: Numeric, S: Size>(value: Vector<N, S>) -> Vector<u32, S> {
+        Packing::order_bits::<N, S>(value)
+    }
+
+    /// Fold a rank from [`Self::rank`] together with the coordinate it came from.
+    pub fn pack_ranked<S: Size>(
+        rank: Vector<u32, S>,
+        coordinate: Vector<u32, S>,
+    ) -> Vector<Packed, S> {
+        // Inverted, so that a lower coordinate makes a larger packed and wins a tie.
+        let tie_break = Vector::new(u32::MAX) - coordinate;
+
+        Packing::fold::<S>(rank, tie_break)
+    }
+
+    fn fold<S: Size>(rank: Vector<u32, S>, tie_break: Vector<u32, S>) -> Vector<Packed, S> {
+        (Vector::<Packed, S>::cast_from(rank) << Vector::new(32u64))
+            | Vector::<Packed, S>::cast_from(tie_break)
+    }
+
+    /// Read back the ranking half, to weigh a candidate against a slot without
+    /// unpacking either into a value.
+    pub fn rank_of<S: Size>(packed: Vector<Packed, S>) -> Vector<u32, S> {
+        Vector::cast_from(packed >> Vector::new(32u64))
+    }
+
+    /// Whether any lane holds a rank that reaches `threshold`.
+    ///
+    /// The lanes rank independently, so one lane wanting to insert is enough to
+    /// make the whole vector do the work. Summing is how a vector answers this,
+    /// since the only reduction cubecl exposes over lanes is a sum.
+    ///
+    /// Equal ranks reach it rather than fall short of it, because a slot still
+    /// holding [`Self::empty`] parks its coordinate at `u32::MAX` and loses the
+    /// tie it would win at any real coordinate. Ranking a candidate that turns
+    /// out not to displace anything costs a walk; dropping one that would have
+    /// leaves the identity's coordinate in the output.
+    pub fn any_reaching<S: Size>(rank: Vector<u32, S>, threshold: Vector<u32, S>) -> bool {
+        let reaches = rank.greater_equal(&threshold);
+
+        Vector::<u32, S>::cast_from(reaches).vector_sum() != 0
     }
 
     /// What a slot that has taken nothing holds: `last`, the value the unpacked

@@ -133,6 +133,19 @@ fn plane_parallel_mixed_nan_f32() {
 }
 
 #[test]
+fn unit_seed_valued_topk_f32() {
+    // Every value equals the value a slot is seeded with, so each one reaches
+    // the weakest slot without passing it. A ranked insert that asks only for
+    // strictly better leaves all three slots holding the seed's `u32::MAX`
+    // coordinate instead of 0, 1 and 2.
+    let case =
+        unit_case(Shape::new([2, 64]), Strides::new(&[64, 1]), 1).with_data(vec![f32::MIN; 128]);
+
+    case.test_topk_with_indices(3);
+    case.test_argmax();
+}
+
+#[test]
 fn unit_parallel_signed_zero_f32() {
     run_signed_zero_extrema(unit_case(Shape::new([9, 64]), Strides::new(&[64, 1]), 1));
 }

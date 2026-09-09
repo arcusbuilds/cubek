@@ -56,6 +56,54 @@ impl TopK {
         comptime!(packs && ranks_several)
     }
 
+    /// Whether an element that cannot reach the weakest slot skips the insert.
+    ///
+    /// Worth it only where a branch is cheap and what it skips is real. A plane
+    /// runs both sides of a divergent branch, so a GPU pays the test and the
+    /// work both; and the branch is only ever not taken because the slots stop
+    /// moving, which is a property of the input, not of the device.
+    fn rejects<P: ReducePrecision>(&self) -> comptime_type!(bool) {
+        let packs = self.packs::<P>();
+        let properties = comptime::device_properties().comptime();
+        let branches_cheaply = comptime!(properties.hardware.num_cpu_cores.is_some());
+
+        comptime!(packs && branches_cheaply)
+    }
+
+    /// Rank a candidate into `packed`, which is held in ranked order.
+    ///
+    /// Ranking is the cheap half of a [`Packed`] and orders values on its own,
+    /// so where [`Self::rejects`] holds, a candidate that cannot reach the
+    /// weakest slot pays only that half: neither the widening that folds in its
+    /// coordinate nor the walk across the slots happens. A NaN needs no special
+    /// case, since its rank is the largest there is and it beats any threshold.
+    fn insert_packed<P: ReducePrecision, N: Numeric, S: Size>(
+        &self,
+        packed: &mut Array<Vector<Packed, S>>,
+        value: Vector<N, S>,
+        coordinate: Vector<u32, S>,
+    ) {
+        let k = comptime!(self.k);
+        let rejects = self.rejects::<P>();
+
+        if comptime!(rejects) {
+            let rank = Packing::rank::<N, S>(value);
+            // Slots are held in ranked order, so the last is the one to beat.
+            let weakest = Packing::rank_of::<S>(packed[comptime!(k - 1)]);
+
+            if Packing::any_reaching::<S>(rank, weakest) {
+                let candidate = Packing::pack_ranked::<S>(rank, coordinate);
+                Packing::insert_ranked::<S>(packed, candidate, k, false);
+            }
+        } else {
+            // Packs whole rather than reusing the branch above's rank: ranking
+            // first sinks the coordinate's load and subtraction past it, which
+            // reorders 72 of the emitted GPU kernels for no gain.
+            let candidate = Packing::pack::<N, S>(value, coordinate);
+            Packing::insert_ranked::<S>(packed, candidate, k, false);
+        }
+    }
+
     /// Insert `insert_val` into the descending-sorted `elements` (and its
     /// coordinate, when it carries one), pushing the smallest slot out.
     ///
@@ -562,18 +610,17 @@ impl<P: ReducePrecision> ReduceInstruction<P> for TopK {
     ) {
         match accumulator {
             Accumulator::Packed(packed) => {
-                let candidate = Packing::pack::<P::EA, P::SI>(
-                    Vector::cast_from(item.elements),
-                    item.args.item(),
-                );
+                let value = Vector::cast_from(item.elements);
+                let coordinate = item.args.item();
                 let packed = packed.multiple_mut();
 
                 match reduce_step {
                     ReduceStep::Plane => {
+                        let candidate = Packing::pack::<P::EA, P::SI>(value, coordinate);
                         this.plane_insert_packed::<P::EA, P::SI>(packed, candidate)
                     }
                     ReduceStep::Identity => {
-                        Packing::insert_ranked::<P::SI>(packed, candidate, this.k, false)
+                        this.insert_packed::<P, P::EA, P::SI>(packed, value, coordinate)
                     }
                 }
             }
