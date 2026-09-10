@@ -88,12 +88,15 @@ impl TopK {
         let rejects = self.rejects::<P>();
 
         if comptime!(rejects) {
-            let rank = Packing::rank::<N, S>(value);
+            // Loose, because this rank is only weighed against the threshold and
+            // never stored: the NaN fix-up is what makes NaNs tie, and it is the
+            // dearest part of the map. An accepted candidate is ranked exactly.
+            let loose = Packing::rank_loose::<N, S>(value);
             // Slots are held in ranked order, so the last is the one to beat.
             let weakest = Packing::rank_of::<S>(packed[comptime!(k - 1)]);
 
-            if Packing::any_reaching::<S>(rank, weakest) {
-                let candidate = Packing::pack_ranked::<S>(rank, coordinate);
+            if Packing::any_reaching::<S>(loose, weakest) {
+                let candidate = Packing::pack::<N, S>(value, coordinate);
                 Packing::insert_ranked::<S>(packed, candidate, k, false);
             }
         } else {

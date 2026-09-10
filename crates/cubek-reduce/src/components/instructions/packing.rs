@@ -55,27 +55,7 @@ impl Packing {
         // Inverted, so that a lower coordinate makes a larger packed and wins a tie.
         let tie_break = Vector::new(u32::MAX) - coordinate;
 
-        Packing::fold::<S>(Packing::rank::<N, S>(value), tie_break)
-    }
-
-    /// The half of a [`Packed`] that orders values, which ranks them on its own
-    /// whenever no tie has to be broken.
-    ///
-    /// Half the width and none of the widening, so a candidate can be weighed
-    /// against [`Self::weakest`] before anything folds a coordinate into it.
-    pub fn rank<N: Numeric, S: Size>(value: Vector<N, S>) -> Vector<u32, S> {
-        Packing::order_bits::<N, S>(value)
-    }
-
-    /// Fold a rank from [`Self::rank`] together with the coordinate it came from.
-    pub fn pack_ranked<S: Size>(
-        rank: Vector<u32, S>,
-        coordinate: Vector<u32, S>,
-    ) -> Vector<Packed, S> {
-        // Inverted, so that a lower coordinate makes a larger packed and wins a tie.
-        let tie_break = Vector::new(u32::MAX) - coordinate;
-
-        Packing::fold::<S>(rank, tie_break)
+        Packing::fold::<S>(Packing::order_bits::<N, S>(value), tie_break)
     }
 
     fn fold<S: Size>(rank: Vector<u32, S>, tie_break: Vector<u32, S>) -> Vector<Packed, S> {
@@ -159,6 +139,28 @@ impl Packing {
     /// coordinate to decide as the instructions' policy states. A winning NaN
     /// therefore reads back as a canonical NaN, not as its input bits.
     fn order_bits<N: Numeric, S: Size>(value: Vector<N, S>) -> Vector<u32, S> {
+        Packing::order_bits_of::<N, S>(value, true)
+    }
+
+    /// [`Self::order_bits`] without the NaN fix-up, which a threshold does not
+    /// need: every NaN already maps above every number, since its exponent is
+    /// all ones and this map only ever flips the sign bit. What the fix-up adds
+    /// is that NaNs tie *with each other*, and a threshold only asks which side
+    /// of it a candidate falls on. A NaN weighed against a slot already holding
+    /// one falls short of that slot's exact `u32::MAX` and is rejected, which is
+    /// the same answer the tie would have given it, since the earlier
+    /// coordinate wins.
+    ///
+    /// It is not enough to store: a slot has to tie, so an accepted candidate is
+    /// ranked again exactly.
+    pub fn rank_loose<N: Numeric, S: Size>(value: Vector<N, S>) -> Vector<u32, S> {
+        Packing::order_bits_of::<N, S>(value, false)
+    }
+
+    fn order_bits_of<N: Numeric, S: Size>(
+        value: Vector<N, S>,
+        #[comptime] exact: bool,
+    ) -> Vector<u32, S> {
         let bits = Vector::<u32, S>::reinterpret(value);
         let sign = Vector::new(SIGN);
         let elem = elem_type_of::<N>();
@@ -172,7 +174,11 @@ impl Packing {
                     bits | sign,
                 );
 
-                select_many(numeric_is_nan(value), Vector::new(u32::MAX), ordered)
+                if comptime!(exact) {
+                    select_many(numeric_is_nan(value), Vector::new(u32::MAX), ordered)
+                } else {
+                    ordered
+                }
             }
             ElemType::Int(_) => bits ^ sign,
             ElemType::UInt(_) => bits,
