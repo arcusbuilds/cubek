@@ -3,6 +3,7 @@ use cubecl::cube;
 use cubecl::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use crate::components::instructions::extremum::numeric_is_nan;
 use crate::components::instructions::{
     Accumulator, AccumulatorExpand, AccumulatorFormat, DynamicSharedAccumulator, Item, Packed,
     Packing, SlotCount, Value, ValueExpand, lowest_coordinate_matching,
@@ -104,6 +105,37 @@ impl TopK {
         }
     }
 
+    /// Whether a coordinate-less candidate that cannot reach the weakest slot
+    /// skips the walk across them.
+    ///
+    /// The same trade as [`Self::rejects`], on the same devices, but nothing has
+    /// to be built first: the slots already hold the values the test compares,
+    /// so no [`Packed`] is involved. It brings [`Self::ranks_total`] with it,
+    /// which the test needs and the walk on its own does not have.
+    fn rejects_values(&self) -> comptime_type!(bool) {
+        let properties = comptime::device_properties().comptime();
+        let branches_cheaply = comptime!(properties.hardware.num_cpu_cores.is_some());
+        let ranks_several = comptime!(self.k > 1);
+
+        comptime!(ranks_several && branches_cheaply)
+    }
+
+    /// Whether the coordinate-less slots rank under a total order.
+    ///
+    /// Rejection reads the last slot as the weakest, which holds only while the
+    /// slots stay sorted, and a bare comparison does not keep them sorted: a NaN
+    /// is neither greater nor smaller than anything, so one that lands leaves
+    /// the slots in an order no later candidate can be weighed against. The
+    /// total order is the CPU reference's, where a NaN outranks every number,
+    /// which leaves an integer accumulation with nothing to place and already
+    /// totally ordered.
+    fn ranks_total<N: Numeric>(&self) -> comptime_type!(bool) {
+        let rejects = self.rejects_values();
+        let elem = elem_type_of::<N>();
+
+        comptime!(rejects && elem.is_float())
+    }
+
     /// Insert `insert_val` into the descending-sorted `elements` (and its
     /// coordinate, when it carries one), pushing the smallest slot out.
     ///
@@ -117,18 +149,29 @@ impl TopK {
         insert_coord: &Value<Vector<u32, S>>,
     ) {
         let k = comptime!(self.k);
-        let mut insert_val = insert_val;
 
         match insert_coord {
             Value::None => {
-                for j in 0..k {
-                    let to_keep = elements[j].greater_than(&insert_val);
-                    let next_val = select_many(to_keep, insert_val, elements[j]);
-                    elements[j] = select_many(to_keep, elements[j], insert_val);
-                    insert_val = next_val;
+                let rejects = self.rejects_values();
+                let total = self.ranks_total::<N>();
+
+                if comptime!(rejects) {
+                    // Slots are held in ranked order, so the last is the one to beat.
+                    // A bare comparison rather than [`keeps_slot`]'s total order: it
+                    // costs one op against five, and it errs towards walking, which
+                    // is only ever slower and never wrong. A NaN is outranked by
+                    // nothing, so it walks and the walk places it.
+                    let outranked = elements[comptime!(k - 1)].greater_than(&insert_val);
+
+                    if !all_lanes::<S>(outranked) {
+                        self.insert_values::<N, S>(elements, insert_val, comptime!(total));
+                    }
+                } else {
+                    self.insert_values::<N, S>(elements, insert_val, comptime!(total));
                 }
             }
             Value::Single(coord) => {
+                let mut insert_val = insert_val;
                 let mut insert_coord = coord.unwrap();
                 let coords = coordinates.multiple_mut();
 
@@ -152,6 +195,25 @@ impl TopK {
         }
     }
 
+    /// Walk `insert_val` down the descending-sorted `elements`, pushing the
+    /// smallest slot out.
+    fn insert_values<N: Numeric, S: Size>(
+        &self,
+        elements: &mut Array<Vector<N, S>>,
+        insert_val: Vector<N, S>,
+        #[comptime] total: bool,
+    ) {
+        let k = comptime!(self.k);
+        let mut insert_val = insert_val;
+
+        for j in 0..k {
+            let to_keep = keeps_slot::<N, S>(elements[j], insert_val, comptime!(total));
+            let next_val = select_many(to_keep, insert_val, elements[j]);
+            elements[j] = select_many(to_keep, elements[j], insert_val);
+            insert_val = next_val;
+        }
+    }
+
     /// Collapse the `k * vector_size` accumulator candidates down to the final `k`
     /// values, for the parallel (reduce axis is the vectorized axis) layout.
     ///
@@ -162,6 +224,7 @@ impl TopK {
         elements: &Value<Vector<P::EA, P::SI>>,
     ) -> Array<Out> {
         let k = comptime!(self.k);
+        let total = self.ranks_total::<P::EA>();
         let vals = elements.multiple();
         let vector_size = vals[0].vector_size().comptime();
 
@@ -171,19 +234,59 @@ impl TopK {
             topk[slot] = Out::min_value();
         }
 
-        #[unroll(k * k * vector_size <= crate::components::instructions::TOPK_UNROLL_BUDGET)]
-        for i in 0..k {
+        if comptime!(total) {
+            // Kept apart from the branch below rather than folded into it with a
+            // comptime flag: the NaN bookkeeping is dead weight where nothing
+            // ranks totally, and leaving it there to be folded away reorders the
+            // emitted GPU kernels.
+            let mut is_nan = Array::new(k);
             #[unroll]
-            for j in 0..vector_size {
-                let mut element = Out::cast_from(vals[i].extract(j));
+            for slot in 0..k {
+                is_nan[slot] = false;
+            }
 
-                #[unroll(k * k * vector_size <= crate::components::instructions::TOPK_UNROLL_BUDGET)]
-                for slot in 0..k {
-                    let current = topk[slot];
-                    let keep = current > element;
+            #[unroll(k * k * vector_size <= crate::components::instructions::TOPK_UNROLL_BUDGET)]
+            for i in 0..k {
+                let nan_lanes = numeric_is_nan(vals[i]);
 
-                    topk[slot] = select(keep, current, element);
-                    element = select(keep, element, current);
+                #[unroll]
+                for j in 0..vector_size {
+                    let mut element = Out::cast_from(vals[i].extract(j));
+                    let mut element_is_nan = nan_lanes.extract(j);
+
+                    #[unroll(
+                        k * k * vector_size <= crate::components::instructions::TOPK_UNROLL_BUDGET
+                    )]
+                    for slot in 0..k {
+                        let current = topk[slot];
+                        let current_is_nan = is_nan[slot];
+                        let keep =
+                            current_is_nan | select(element_is_nan, false, current > element);
+
+                        topk[slot] = select(keep, current, element);
+                        is_nan[slot] = select(keep, current_is_nan, element_is_nan);
+                        element = select(keep, element, current);
+                        element_is_nan = select(keep, element_is_nan, current_is_nan);
+                    }
+                }
+            }
+        } else {
+            #[unroll(k * k * vector_size <= crate::components::instructions::TOPK_UNROLL_BUDGET)]
+            for i in 0..k {
+                #[unroll]
+                for j in 0..vector_size {
+                    let mut element = Out::cast_from(vals[i].extract(j));
+
+                    #[unroll(
+                        k * k * vector_size <= crate::components::instructions::TOPK_UNROLL_BUDGET
+                    )]
+                    for slot in 0..k {
+                        let current = topk[slot];
+                        let keep = current > element;
+
+                        topk[slot] = select(keep, current, element);
+                        element = select(keep, element, current);
+                    }
                 }
             }
         }
@@ -531,6 +634,40 @@ impl TopK {
         for i in 0..k {
             elements[i] = final_elements[i];
         }
+    }
+}
+
+/// Whether every lane is set.
+///
+/// Summing is how a vector answers a question about its lanes, since the only
+/// reduction cubecl exposes over them is a sum.
+#[cube]
+fn all_lanes<S: Size>(mask: Vector<bool, S>) -> bool {
+    let lanes = mask.vector_size().comptime();
+
+    Vector::<u32, S>::cast_from(mask).vector_sum() == comptime!(lanes as u32)
+}
+
+/// Whether a slot holding `current` keeps it rather than taking `candidate`.
+///
+/// Under the total order a NaN slot keeps its NaN and a NaN candidate displaces
+/// any number, which is the reference's rule and what leaves the slots sorted
+/// for the next candidate to be weighed against. Equal values keep the slot, so
+/// the earlier candidate wins the tie.
+#[cube]
+fn keeps_slot<N: Numeric, S: Size>(
+    current: Vector<N, S>,
+    candidate: Vector<N, S>,
+    #[comptime] total: bool,
+) -> Vector<bool, S> {
+    let ahead = current.greater_than(&candidate);
+
+    if comptime!(total) {
+        let outranks = select_many(numeric_is_nan(candidate), Vector::new(false), ahead);
+
+        numeric_is_nan(current).or(outranks)
+    } else {
+        ahead
     }
 }
 

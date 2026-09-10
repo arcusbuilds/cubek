@@ -30,13 +30,24 @@ fn run_extrema(case: TestCase, data: Vec<f32>) {
     case.test_max_with_indices();
     case.test_min_with_indices();
 
-    // Top-k with indices is the only reduction left that ranks through a packed
-    // value, so it is the only coverage the packed total order gets. Values-only
-    // top-k is deliberately not here: it ranks with a bare `>` and gives a NaN
-    // none of the precedence the reference and every other row above state.
     if case.shape[case.axis.unwrap()] >= 3 {
         case.test_topk_with_indices(3);
+
+        // Values-only top-k joins the rows above only where it ranks totally.
+        // Everywhere else it still ranks with a bare `>`, which gives a NaN none
+        // of the precedence the reference and every other row here state.
+        if ranks_values_totally() {
+            case.test_topk(3);
+        }
     }
+}
+
+/// Whether values-only top-k ranks under the total order, which it does on the
+/// devices where rejection makes it worth having.
+fn ranks_values_totally() -> bool {
+    let client = cubecl::test_device().client();
+
+    client.properties().hardware.num_cpu_cores.is_some()
 }
 
 fn run_nan_extrema(case: TestCase) {
